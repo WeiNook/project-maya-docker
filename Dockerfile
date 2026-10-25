@@ -31,10 +31,10 @@ RUN cmake -S . -B build -G Ninja \
       -DSTRATA_ENABLE_CUDA=ON \
       -DSTRATA_BUILD_TESTS=OFF \
       -DSTRATA_PORTABLE=ON \
-    && cmake --build build --target strata --parallel 2 \
-    && install -D -m 0755 build/strata /out/strata \
-    && printf '%s\n' "${MAYA_SOURCE_REF}" > /out/MAYA_SOURCE_REF \
-    && printf '%s\n' "${CUDA_ARCH}" > /out/CUDA_ARCH
+&& cmake --build build --target maya --parallel 2 \
+&& install -D -m 0755 build/maya /out/maya \
+&& printf '%s\n' "${MAYA_SOURCE_REF}" > /out/MAYA_SOURCE_REF \
+&& printf '%s\n' "${CUDA_ARCH}" > /out/CUDA_ARCH
 
 # ---------- Runtime stage ----------
 FROM ${CUDA_RUNTIME_IMAGE} AS runtime
@@ -54,7 +54,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libnuma1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /out/strata /usr/local/bin/strata
+COPY --from=build /out/maya /usr/local/bin/maya
 COPY --from=build /out/MAYA_SOURCE_REF /usr/share/project-maya/MAYA_SOURCE_REF
 COPY --from=build /out/CUDA_ARCH /usr/share/project-maya/CUDA_ARCH
 
