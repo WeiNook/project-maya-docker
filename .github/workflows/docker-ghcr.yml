@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       maya_tag:
-        description: "要构建的 mw00/project-maya 源码 tag，例如 v1.2.3"
+        description: "要构建的 mw00/project-maya 源码 tag，例如 v1.1.56"
         required: true
         type: string
 
@@ -15,13 +15,16 @@ permissions:
 env:
   REGISTRY: ghcr.io
   SOURCE_REPOSITORY: mw00/project-maya
+  CUDA_MAJOR: "13"
+  CUDA_ARCHS: "86"
 
 jobs:
   build-and-push:
     runs-on: ubuntu-24.04
+    timeout-minutes: 360
 
     steps:
-      # 检出当前构建仓库，以便读取这里的 Dockerfile。
+      # 检出当前构建仓库（只用于获取工作流本身）。
       - name: Checkout build repository
         uses: actions/checkout@v5
         with:
@@ -35,24 +38,19 @@ jobs:
           MAYA_TAG: ${{ inputs.maya_tag }}
         run: |
           set -euo pipefail
-
-          # 限制为 Docker tag 可用的安全字符，并避免生成过长的镜像 tag。
-          if [[ ! "$MAYA_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$ ]]; then
-            echo "无效的 Maya tag：$MAYA_TAG"
-            echo "请使用不超过 80 个字符的 tag，且只包含字母、数字、点、下划线或连字符。"
+          if [[ ! "$MAYA_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "无效的 Maya tag：$MAYA_TAG（需要 vX.Y.Z 格式）"
             exit 1
           fi
-
           if ! git ls-remote --exit-code --refs \
             "https://github.com/${SOURCE_REPOSITORY}.git" \
             "refs/tags/${MAYA_TAG}" >/dev/null; then
             echo "源仓库 ${SOURCE_REPOSITORY} 中找不到 tag：${MAYA_TAG}"
             exit 1
           fi
-
           echo "tag=${MAYA_TAG}" >> "$GITHUB_OUTPUT"
 
-      # 将指定 tag 的 Maya 源码检出到 maya-source 目录。
+      # 检出指定 tag 的 Maya 源码。build.sh 通过 git archive 读取源码，所以需要完整历史。
       - name: Checkout Maya source
         uses: actions/checkout@v5
         with:
@@ -63,14 +61,45 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Prepare image name
-        id: image
-        shell: bash
+      # 按官方文档用 build.sh 构建。它会先做全部检查，检查失败就不会继续。
+      - name: Build image with docker/build.sh
+        working-directory: maya-source
+        env:
+          MAYA_TAG: ${{ steps.maya-tag.outputs.tag }}
         run: |
-          echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          docker/build.sh --cuda "$CUDA_MAJOR" --archs "$CUDA_ARCHS" --ref "$MAYA_TAG"
+          docker image ls
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+      # 找到 build.sh 生成的本地镜像，例如 project-maya:1.1.56-cuda13。
+      - name: Find local image
+        id: local
+        shell: bash
+        env:
+          MAYA_TAG: ${{ steps.maya-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${MAYA_TAG#v}"
+          image="project-maya:${version}-cuda${CUDA_MAJOR}"
+          if ! docker image inspect "$image" >/dev/null 2>&1; then
+            echo "找不到本地镜像 ${image}，请检查上面 docker image ls 的输出"
+            exit 1
+          fi
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+      # 额外冒烟测试：确认服务、pack 工具和引擎都在镜像里。
+      - name: Smoke test image contents
+        shell: bash
+        env:
+          IMAGE: ${{ steps.local.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /bin/sh "$IMAGE" -c '
+            test -f /opt/maya/serve/server.py &&
+            test -f /opt/maya/tools/iq_pack.py &&
+            test -x /opt/maya/build/maya &&
+            test -x /opt/maya/.venv/bin/python
+          '
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
@@ -79,21 +108,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push A10 image
-        uses: docker/build-push-action@v7
-        with:
-          context: ./maya-source
-          file: ./Dockerfile
-          platforms: linux/amd64
-          push: true
-          build-args: |
-            CUDA_DEVEL_IMAGE=nvidia/cuda:13.1.2-devel-ubuntu24.04
-            CUDA_RUNTIME_IMAGE=nvidia/cuda:13.1.2-runtime-ubuntu24.04
-            CUDA_ARCH=86
-            MAYA_SOURCE_REF=${{ steps.maya-tag.outputs.tag }}
-          tags: |
-            ghcr.io/${{ steps.image.outputs.name }}:cuda13.1.2-sm86-a10-maya-${{ steps.maya-tag.outputs.tag }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/mw00/project-maya
-            org.opencontainers.image.version=${{ steps.maya-tag.outputs.tag }}
-            org.opencontainers.image.revision=${{ github.sha }}
+      # 镜像名与原流程一致：ghcr.io/weinook/project-maya-docker
+      - name: Tag and push image
+        shell: bash
+        env:
+          IMAGE: ${{ steps.local.outputs.image }}
+          MAYA_TAG: ${{ steps.maya-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          repo="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+          target="${repo}:cuda13.1.2-sm86-a10-maya-${MAYA_TAG}"
+          docker tag "$IMAGE" "$target"
+          docker push "$target"
